@@ -1,154 +1,229 @@
-# فایل face detection whit camera
-
-# اتصال به دیتابیس های redis و mysql
-
-# اتصال در لحظه و همیشگی به دوربین از بین تصویری که تحت نظر دارد به دنبال چهره یک انسان میگردد .
-# هرگاه چهره ای را تشخیص داده از آن عکس میگیرد .
-# عکس گرفته شده از چهره را با توجه به پارامتر هایی که برای چهره ی هر انسانی متفاوت است ، encode  میکند Encode مذکور را
-# با تمامی encode های ذخیره شده از قبل در دیتا بیس redis از نظر مطابقت بررسی می کند
-# حالا که به اطلاعات کاربری شخصی که از روبروی دوربین رد شده و دسترسی داریم اطلاعات آن را در جدول حضور غیاب از دیتا بیس mysql ذخیره می نماییم
-
-
 import cv2
-import redis
-import base64
 import numpy as np
-from persiantools.jdatetime import JalaliDateTime
 import mysql.connector
 from datetime import datetime
+from persiantools.jdatetime import JalaliDateTime
+import schedule
+import time
 
-# اتصال به Redis
-redis_connection = redis.StrictRedis(host='localhost', port=6379, decode_responses=True)
 
-# اتصال به MySQL
-mysql_connection = mysql.connector.connect(
-    host='localhost',
-    database='face_recognition',
-    user='root',
-    password='1234'
-)
+# --------------------- کلاس مدیریت دوربین‌ها ---------------------
+class CameraManager:
+    def __init__(self):
+        self.cameras = []
+        self.grid_size = (2, 2)  # (تعداد ردیف‌ها، تعداد ستون‌ها)
+        self.active_cam = -1  # حالت تمام صفحه: -1 یعنی حالت گرید
+        self.window_name = "Face Recognition System"  # تغییر نام به انگلیسی برای اطمینان از سازگاری
+        self.last_click = 0
+        self.click_delay = 500  # میلی‌ثانیه
 
-# استفاده از کلاسی برای تشخیص چهره
-face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+        # بارگذاری مدل تشخیص چهره
+        self.face_cascade = cv2.CascadeClassifier(
+            cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+        )
+        self.face_recognizer = cv2.face.LBPHFaceRecognizer_create()
+        self.face_recognizer.read('trainer/model.xml')
 
-# بارگذاری مدل تشخیص چهره OpenCV برای شناسایی (LBPH یا مدل‌های پیشرفته)
-face_recognizer = cv2.face.LBPHFaceRecognizer_create()
-face_recognizer.read('trainer/model.xml')  # بارگذاری مدل آموزش‌دیده
+        # تنظیم اتصال به دیتابیس
+        try:
+            self.db = mysql.connector.connect(
+                host='localhost',
+                database='face_recognition',
+                user='root',
+                password='1234'
+            )
+            print("✅ اتصال به دیتابیس برقرار شد.")
+        except mysql.connector.Error as err:
+            print(f"❌ خطا در اتصال به دیتابیس: {err}")
+            self.db = None
+        self.last_checkin = {}
 
-# تابع اصلاح پدینگ Base64
-def correct_base64_padding(base64_string):
-    padding = len(base64_string) % 4
-    if padding != 0:
-        base64_string += '=' * (4 - padding)
-    return base64_string
-
-# تبدیل تصویر رشته Base64 به تصویر OpenCV
-def base64_to_cv2(base64_string):
-    base64_string = correct_base64_padding(base64_string)  # اصلاح پدینگ قبل از دیکد کردن
-    try:
-        decoded_data = base64.b64decode(base64_string)  # دیکد کردن داده‌ها
-        np_data = np.frombuffer(decoded_data, np.uint8)  # تبدیل به داده‌های عددی
-        image = cv2.imdecode(np_data, cv2.IMREAD_COLOR)  # تبدیل به تصویر OpenCV
-        return image
-    except Exception as e:
-        print(f"Error in decoding base64 string: {e}")
-        return None  # در صورت بروز خطا، None برمی‌گرداند
-
-# تبدیل تصویر OpenCV به رشته Base64
-def cv2_to_base64(image):
-    _, buffer = cv2.imencode('.jpg', image)
-    return base64.b64encode(buffer).decode('utf-8')
-
-# فلگ برای بررسی ثبت تکراری
-is_person_detected = False
-
-# اتصال به دوربین
-camera = cv2.VideoCapture(0)
-
-while True:
-    # خواندن تصویر از دوربین
-    ret, frame = camera.read()
-
-    # تشخیص چهره‌ها در تصویر
-    faces = face_cascade.detectMultiScale(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
-
-    # نمایش مستطیل دور چهره‌ها و بررسی تشخیص هر چهره با موجودیت‌های قبلی
-    for (x, y, w, h) in faces:
-        cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)  # مربع سبز برای چهره‌ها
-
-        # برش تصویر چهره
-        face_roi = frame[y:y + h, x:x + w]
-
-        # تبدیل تصویر چهره به رشته Base64
-        face_encoded_str = cv2_to_base64(face_roi)
-
-        # جستجو در دیتابیس Redis برای کلید‌هایی که به عنوان کد ملی شناخته شده‌اند
-        matched = False  # فلگ برای نشان دادن اینکه فرد شناسایی شده است
-        for key in redis_connection.scan_iter():
-            national_code = key  # Redis keys are already strings in Python 3
-
-            # دریافت تصویر چهره از دیتابیس Redis
-            face_from_redis = redis_connection.get(national_code)
-            if face_from_redis:
-                face_decoded = base64_to_cv2(face_from_redis)
-
-                # تبدیل تصویر چهره به خاکستری (grayscale) قبل از پیش‌بینی
-                face_roi_gray = cv2.cvtColor(face_roi, cv2.COLOR_BGR2GRAY)
-
-                # مقایسه چهره‌ها با استفاده از LBPH یا روش‌های پیچیده‌تر
-                label, confidence = face_recognizer.predict(face_roi_gray)
-
-                if confidence < 100 and not is_person_detected:
-                    matched = True  # فرد شناسایی شده است
-                    print(f"Face matched with national code: {national_code} with confidence: {confidence}")
-
-                    # بررسی وجود رکورد‌های قبلی در جدول MatchedPersons با تاریخ فعلی
-                    current_date = datetime.now().strftime('%Y-%m-%d')
-                    cursor = mysql_connection.cursor()
-                    cursor.execute("SELECT COUNT(*) FROM MatchedPersons WHERE nationalCode = %s AND detectionTime LIKE %s",
-                                   (national_code, f"{current_date}%"))
-                    existing_records_count = cursor.fetchone()[0]
-
-                    # اگر هیچ رکوردی با تاریخ مشخص در اون روز یافت نشد، اطلاعات را در جدول ذخیره کنید
-                    if existing_records_count == 0:
-                        # دریافت اطلاعات فرد از دیتابیس MySQL
-                        cursor.execute("SELECT firstName, lastName FROM NewPerson WHERE nationalCode = %s",
-                                       (national_code,))
-                        person_data = cursor.fetchone()
-
-                        # بررسی اینکه آیا داده‌های فرد موجود هستند
-                        if person_data:
-                            first_name, last_name = person_data
-                            # ذخیره تاریخ و زمان شمسی فعلی
-                            current_jalali_time = JalaliDateTime.now().strftime('%Y-%m-%d %H:%M:%S')
-
-                            # ذخیره اطلاعات در جدول جدید
-                            cursor.execute(
-                                "INSERT INTO MatchedPersons (nationalCode, firstName, lastName, detectionTime) VALUES (%s, %s, %s, %s)",
-                                (national_code, first_name, last_name, current_jalali_time))
-                            mysql_connection.commit()
-                            is_person_detected = True
-                        else:
-                            print(f"No data found for national code: {national_code}")
-                    else:
-                        print(f"This person has already been detected today.")
-
-        # اگر فرد شناسایی شده است، نام او را زیر تصویر نشان می‌دهیم
-        if matched:
-            cv2.putText(frame, f"Detected: {national_code}", (x, y + h + 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+    def add_camera(self, name, source, location):
+        """اضافه کردن دوربین به لیست مدیریت"""
+        cap = cv2.VideoCapture(source)
+        if cap.isOpened():
+            self.cameras.append({
+                'cap': cap,
+                'name': name,
+                'location': location,
+                'frame': None
+            })
+            print(f"✅ دوربین '{name}' در '{location}' فعال شد!")
         else:
-            cv2.putText(frame, f"Not Detected", (x, y + h + 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+            print(f"❌ خطا در اتصال به دوربین '{name}'")
+            # آزادسازی شی cap در صورت عدم موفقیت
+            cap.release()
 
-    # نمایش تصویر باز شده
-    cv2.imshow('Camera', frame)
+    def process_faces(self, frame, location):
+        """پردازش چهره‌ها در فریم دریافتی"""
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-    # ایجاد امکان خروج از حلقه با فشردن کلید 'q'
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
+        # افزایش دقت تشخیص با اعمال هیستوگرام سازگاری و بلور گوسی
+        gray = cv2.equalizeHist(gray)
+        faces = self.face_cascade.detectMultiScale(gray, scaleFactor=1.3, minNeighbors=5)
 
-# آزاد کردن دوربین و بستن پنجره‌های نمایش
-camera.release()
-cv2.destroyAllWindows()
+        for (x, y, w, h) in faces:
+            # رسم مستطیل دور چهره تشخیص داده‌شده
+            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+            face_roi = gray[y:y + h, x:x + w]
+
+            # شناسایی چهره با استفاده از LBPH
+            label, confidence = self.face_recognizer.predict(face_roi)
+            if confidence < 100:
+                # ثبت حضور در دیتابیس
+                self.log_attendance(str(label), location)
+
+        return cv2.resize(frame, (640, 480))
+
+    def log_attendance(self, national_code, location):
+        """
+        ثبت حضور در جدول attendance و به‌روزرسانی آخرین حضور در latest_attendance.
+        از جلوگیری از ثبت حضور مکرر در بازه 2 ساعته نیز پشتیبانی می‌کند.
+        """
+        if self.db is None:
+            print("❌ دیتابیس متصل نیست. حضور ثبت نخواهد شد.")
+            return
+
+        now = datetime.now()
+        if national_code in self.last_checkin:
+            if (now - self.last_checkin[national_code]).total_seconds() < 7200:
+                return  # اگر کمتر از 2 ساعت از ثبت حضور قبلی گذشته باشد، ثبت نمی‌کند
+
+        try:
+            cursor = self.db.cursor()
+
+            # زمان به‌روز شده به فرمت جلالی
+            jalali_time = JalaliDateTime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+            # ثبت رکورد در جدول attendance
+            insert_attendance = """
+                INSERT INTO attendance (national_code, checkin_time, location)
+                VALUES (%s, %s, %s)
+            """
+            cursor.execute(insert_attendance, (national_code, jalali_time, location))
+            self.db.commit()
+
+            # دریافت اطلاعات کاربری (نام و نام خانوادگی) از جدول NewPerson
+            select_user = "SELECT first_name, last_name FROM NewPerson WHERE national_code = %s"
+            cursor.execute(select_user, (national_code,))
+            user = cursor.fetchone()
+
+            if user:
+                first_name, last_name = user
+            else:
+                first_name, last_name = "نامشخص", "نامشخص"
+
+            # ثبت یا به‌روزرسانی آخرین حضور در جدول latest_attendance
+            insert_latest = """
+                INSERT INTO latest_attendance (national_code, first_name, last_name, last_seen, location)
+                VALUES (%s, %s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE 
+                    first_name = VALUES(first_name),
+                    last_name = VALUES(last_name),
+                    last_seen = VALUES(last_seen),
+                    location = VALUES(location)
+            """
+            cursor.execute(insert_latest, (national_code, first_name, last_name, jalali_time, location))
+            self.db.commit()
+
+            self.last_checkin[national_code] = now
+            print(f"✅ حضور کاربر {national_code} ({first_name} {last_name}) در {location} ثبت شد")
+        except Exception as e:
+            print(f"❌ خطای دیتابیس: {e}")
+
+    def update_frames(self):
+        """به‌روز کردن فریم‌های هر دوربین"""
+        for cam in self.cameras:
+            ret, frame = cam['cap'].read()
+            if ret:
+                cam['frame'] = self.process_faces(frame, cam['location'])
+            else:
+                cam['frame'] = np.zeros((480, 640, 3), dtype=np.uint8)
+
+    def toggle_fullscreen(self, x, y):
+        """تغییر حالت نمایش: از نمایش گرید به حالت تمام صفحه"""
+        current_time = cv2.getTickCount()
+        if (current_time - self.last_click) * 1000 / cv2.getTickFrequency() < self.click_delay:
+            return
+
+        if self.active_cam == -1:
+            col = x // (640 + 10)
+            row = y // (480 + 10)
+            idx = row * self.grid_size[1] + col
+            if idx < len(self.cameras):
+                self.active_cam = idx
+        else:
+            self.active_cam = -1
+
+        self.last_click = current_time
+
+    def show_interface(self):
+        """نمایش رابط کاربری: حالت گرید دوربین‌ها با فضای خالی برای دوربین‌های غیرفعال"""
+        if self.active_cam != -1:
+            frame = self.cameras[self.active_cam]['frame']
+            cv2.imshow(self.window_name, frame)
+        else:
+            if not self.cameras:
+                black_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+                cv2.imshow(self.window_name, black_frame)
+                return
+
+            grid_frames = []
+            for i in range(0, len(self.cameras), self.grid_size[1]):
+                row_frames = [cam['frame'] if cam['frame'] is not None else np.zeros((480, 640, 3), dtype=np.uint8)
+                              for cam in self.cameras[i:i + self.grid_size[1]]]
+                while len(row_frames) < self.grid_size[1]:
+                    row_frames.append(np.zeros((480, 640, 3), dtype=np.uint8))
+                grid_frames.append(np.hstack(row_frames))
+            final_grid = np.vstack(grid_frames[:self.grid_size[0]])
+            cv2.imshow(self.window_name, final_grid)
 
 
-    
+# --------------------- تنظیمات سیستم ---------------------
+def main():
+    manager = CameraManager()
+
+    # اضافه کردن دوربین‌ها
+    manager.add_camera("دوربین لپتاپ", 0, "دوربین لپتاپ")
+    manager.add_camera("نماز خانه", "rtsp://admin:shn123456789@192.168.1.101:554/cam/realmonitor?channel=1",
+                       "نماز خانه")
+
+    # زمان‌بندی پاکسازی last_checkin هر 2 ساعت
+    schedule.every(2).hours.do(manager.last_checkin.clear)
+
+    # تعریف تابع مدیریت رویدادهای ماوس
+    def mouse_handler(event, x, y, flags, param):
+        if event == cv2.EVENT_LBUTTONDBLCLK:
+            manager.toggle_fullscreen(x, y)
+
+    # ایجاد پنجره نمایش به همراه یک تصویر اولیه
+    cv2.namedWindow(manager.window_name, cv2.WINDOW_NORMAL)
+    cv2.imshow(manager.window_name, np.zeros((480, 640, 3), dtype=np.uint8))
+
+    try:
+        cv2.setMouseCallback(manager.window_name, mouse_handler)
+    except cv2.error as e:
+        print(f"❌ خطا در تنظیم رویدادهای ماوس: {e}")
+
+    if not manager.cameras:
+        print("❌ هیچ دوربینی متصل نشد. برنامه در حالت شبیه‌سازی ادامه می‌یابد.")
+
+    # حلقه اصلی برنامه
+    try:
+        while True:
+            manager.update_frames()
+            manager.show_interface()
+            schedule.run_pending()
+
+            if cv2.waitKey(1) == 27:  # خروج با کلید ESC
+                break
+    finally:
+        for cam in manager.cameras:
+            cam['cap'].release()
+        cv2.destroyAllWindows()
+        if manager.db:
+            manager.db.close()
+
+
+if __name__ == '__main__':
+    main()
