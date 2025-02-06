@@ -5,7 +5,15 @@ from datetime import datetime
 from persiantools.jdatetime import JalaliDateTime
 import schedule
 import time
+import logging
 
+# تنظیمات لاگینگ
+logging.basicConfig(
+    level=logging.INFO,  # برای مشاهده اطلاعات بیشتر، این سطح را به DEBUG تغییر دهید
+    format='[%(asctime)s] %(levelname)s: %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
 
 # --------------------- کلاس مدیریت دوربین‌ها ---------------------
 class CameraManager:
@@ -13,7 +21,7 @@ class CameraManager:
         self.cameras = []
         self.grid_size = (2, 2)  # (تعداد ردیف‌ها، تعداد ستون‌ها)
         self.active_cam = -1  # حالت تمام صفحه: -1 یعنی حالت گرید
-        self.window_name = "Face Recognition System"  # تغییر نام به انگلیسی برای اطمینان از سازگاری
+        self.window_name = "Face Recognition System"  # نام پنجره نمایش
         self.last_click = 0
         self.click_delay = 500  # میلی‌ثانیه
 
@@ -32,45 +40,66 @@ class CameraManager:
                 user='root',
                 password='1234'
             )
-            print("✅ اتصال به دیتابیس برقرار شد.")
+            logger.info("اتصال به دیتابیس برقرار شد.")
         except mysql.connector.Error as err:
-            print(f"❌ خطا در اتصال به دیتابیس: {err}")
+            logger.error(f"خطا در اتصال به دیتابیس: {err}")
             self.db = None
+
+        # در این دیکشنری، برای هر کاربر زمان و مکان آخرین حضور ذخیره می‌شود.
         self.last_checkin = {}
 
     def add_camera(self, name, source, location):
-        """اضافه کردن دوربین به لیست مدیریت"""
+        """
+        اضافه کردن دوربین به لیست مدیریت
+        اگر منبع دوربین عددی (مثلاً 0) نباشد، آن را به عنوان دوربین خارجی (مثلاً الوهاست) در نظر می‌گیریم
+        """
         cap = cv2.VideoCapture(source)
         if cap.isOpened():
+            # تعیین نوع دوربین: True یعنی دوربین خارجی (مداربسته) که نیاز به شبیه‌سازی فاصله کانونی دارد
+            is_external = False if isinstance(source, int) and source == 0 else True
             self.cameras.append({
                 'cap': cap,
                 'name': name,
                 'location': location,
-                'frame': None
+                'frame': None,
+                'is_external': is_external  # مشخص‌کننده اینکه آیا دوربین خارجی است یا نه
             })
-            print(f"✅ دوربین '{name}' در '{location}' فعال شد!")
+            logger.info(f"دوربین '{name}' در '{location}' فعال شد!")
         else:
-            print(f"❌ خطا در اتصال به دوربین '{name}'")
-            # آزادسازی شی cap در صورت عدم موفقیت
+            logger.error(f"خطا در اتصال به دوربین '{name}'")
             cap.release()
 
-    def process_faces(self, frame, location):
-        """پردازش چهره‌ها در فریم دریافتی"""
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    def adjust_focal_distance(self, frame, zoom_factor=1.5):
+        """
+        شبیه‌سازی تنظیم فاصله کانونی با استفاده از تکنیک زوم دیجیتال (کراس کردن قسمت میانی فریم)
+        پارامتر zoom_factor میزان زوم را تعیین می‌کند؛ مقدار بزرگتر به معنی زوم بیشتر (کراس کوچکتر) است.
+        """
+        h, w = frame.shape[:2]
+        new_w = int(w / zoom_factor)
+        new_h = int(h / zoom_factor)
+        x1 = (w - new_w) // 2
+        y1 = (h - new_h) // 2
+        cropped = frame[y1:y1+new_h, x1:x1+new_w]
+        adjusted = cv2.resize(cropped, (640, 480))
+        return adjusted
 
-        # افزایش دقت تشخیص با اعمال هیستوگرام سازگاری و بلور گوسی
+    def process_faces(self, frame, location):
+        """
+        پردازش چهره‌ها در فریم دریافتی:
+         - تبدیل فریم به سیاه و سفید
+         - اعمال هیستوگرام سازگاری برای افزایش کنتراست
+         - تشخیص چهره‌ها و رسم مستطیل دور آن‌ها
+         - شناسایی چهره و ثبت حضور در دیتابیس در صورت شناسایی صحیح
+        """
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         gray = cv2.equalizeHist(gray)
         faces = self.face_cascade.detectMultiScale(gray, scaleFactor=1.3, minNeighbors=5)
 
         for (x, y, w, h) in faces:
-            # رسم مستطیل دور چهره تشخیص داده‌شده
             cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
             face_roi = gray[y:y + h, x:x + w]
-
-            # شناسایی چهره با استفاده از LBPH
             label, confidence = self.face_recognizer.predict(face_roi)
             if confidence < 100:
-                # ثبت حضور در دیتابیس
                 self.log_attendance(str(label), location)
 
         return cv2.resize(frame, (640, 480))
@@ -78,42 +107,53 @@ class CameraManager:
     def log_attendance(self, national_code, location):
         """
         ثبت حضور در جدول attendance و به‌روزرسانی آخرین حضور در latest_attendance.
-        از جلوگیری از ثبت حضور مکرر در بازه 2 ساعته نیز پشتیبانی می‌کند.
+        منطق جدید:
+          - اگر کاربر برای اولین بار دیده شده باشد، رکورد جدید در هر دو جدول ثبت می‌شود.
+          - اگر کاربر قبلاً دیده شده باشد، در صورتی که از حضور قبلی بیش از 2 ساعت گذشته باشد یا
+            لوکیشن (دوربین) تغییر کرده باشد، رکورد جدید در جدول attendance ثبت می‌شود.
+          - در هر صورت، جدول latest_attendance به روز می‌شود.
         """
         if self.db is None:
-            print("❌ دیتابیس متصل نیست. حضور ثبت نخواهد شد.")
+            logger.error("دیتابیس متصل نیست. حضور ثبت نخواهد شد.")
             return
 
         now = datetime.now()
+        jalali_time = JalaliDateTime.now().strftime('%Y-%m-%d %H:%M:%S')
+        cursor = self.db.cursor()
+
+        should_insert_attendance = False
         if national_code in self.last_checkin:
-            if (now - self.last_checkin[national_code]).total_seconds() < 7200:
-                return  # اگر کمتر از 2 ساعت از ثبت حضور قبلی گذشته باشد، ثبت نمی‌کند
+            last_time, last_location = self.last_checkin[national_code]
+            time_diff = (now - last_time).total_seconds()
+            if time_diff >= 7200 or last_location != location:
+                should_insert_attendance = True
+        else:
+            should_insert_attendance = True
+
+        if should_insert_attendance:
+            try:
+                insert_attendance = """
+                    INSERT INTO attendance (national_code, checkin_time, location)
+                    VALUES (%s, %s, %s)
+                """
+                cursor.execute(insert_attendance, (national_code, jalali_time, location))
+                self.db.commit()
+            except Exception as e:
+                logger.error(f"خطای ثبت حضور در جدول attendance: {e}")
 
         try:
-            cursor = self.db.cursor()
-
-            # زمان به‌روز شده به فرمت جلالی
-            jalali_time = JalaliDateTime.now().strftime('%Y-%m-%d %H:%M:%S')
-
-            # ثبت رکورد در جدول attendance
-            insert_attendance = """
-                INSERT INTO attendance (national_code, checkin_time, location)
-                VALUES (%s, %s, %s)
-            """
-            cursor.execute(insert_attendance, (national_code, jalali_time, location))
-            self.db.commit()
-
-            # دریافت اطلاعات کاربری (نام و نام خانوادگی) از جدول NewPerson
             select_user = "SELECT first_name, last_name FROM NewPerson WHERE national_code = %s"
             cursor.execute(select_user, (national_code,))
             user = cursor.fetchone()
-
             if user:
                 first_name, last_name = user
             else:
                 first_name, last_name = "نامشخص", "نامشخص"
+        except Exception as e:
+            logger.error(f"خطا در دریافت اطلاعات کاربر: {e}")
+            first_name, last_name = "نامشخص", "نامشخص"
 
-            # ثبت یا به‌روزرسانی آخرین حضور در جدول latest_attendance
+        try:
             insert_latest = """
                 INSERT INTO latest_attendance (national_code, first_name, last_name, last_seen, location)
                 VALUES (%s, %s, %s, %s, %s)
@@ -125,23 +165,33 @@ class CameraManager:
             """
             cursor.execute(insert_latest, (national_code, first_name, last_name, jalali_time, location))
             self.db.commit()
-
-            self.last_checkin[national_code] = now
-            print(f"✅ حضور کاربر {national_code} ({first_name} {last_name}) در {location} ثبت شد")
+            self.last_checkin[national_code] = (now, location)
+            logger.info(f"حضور کاربر {national_code} ({first_name} {last_name}) در {location} ثبت شد")
         except Exception as e:
-            print(f"❌ خطای دیتابیس: {e}")
+            logger.error(f"خطای به‌روز رسانی latest_attendance: {e}")
 
     def update_frames(self):
-        """به‌روز کردن فریم‌های هر دوربین"""
+        """
+        به‌روز کردن فریم‌های هر دوربین:
+         - خواندن فریم از هر دوربین
+         - در صورت موفقیت در خواندن، اعمال تنظیم فاصله کانونی برای دوربین‌های خارجی (شبیه‌سازی زوم)
+         - پردازش فریم برای تشخیص چهره
+         - در صورت عدم دریافت فریم، استفاده از یک فریم سیاه به عنوان جایگزین
+        """
         for cam in self.cameras:
             ret, frame = cam['cap'].read()
             if ret:
+                if cam.get('is_external', False):
+                    frame = self.adjust_focal_distance(frame, zoom_factor=1.5)
                 cam['frame'] = self.process_faces(frame, cam['location'])
             else:
                 cam['frame'] = np.zeros((480, 640, 3), dtype=np.uint8)
 
     def toggle_fullscreen(self, x, y):
-        """تغییر حالت نمایش: از نمایش گرید به حالت تمام صفحه"""
+        """
+        تغییر حالت نمایش:
+         - از حالت گرید به حالت تمام صفحه و بالعکس با دو کلیک موس
+        """
         current_time = cv2.getTickCount()
         if (current_time - self.last_click) * 1000 / cv2.getTickFrequency() < self.click_delay:
             return
@@ -158,7 +208,12 @@ class CameraManager:
         self.last_click = current_time
 
     def show_interface(self):
-        """نمایش رابط کاربری: حالت گرید دوربین‌ها با فضای خالی برای دوربین‌های غیرفعال"""
+        """
+        نمایش رابط کاربری:
+         - در حالت تمام صفحه، فقط فریم یک دوربین نمایش داده می‌شود.
+         - در حالت گرید، فریم‌های دوربین‌ها به صورت شبکه‌ای نمایش داده می‌شوند.
+         - در صورت عدم اتصال هیچ دوربینی، یک فریم سیاه نمایش داده می‌شود.
+        """
         if self.active_cam != -1:
             frame = self.cameras[self.active_cam]['frame']
             cv2.imshow(self.window_name, frame)
@@ -183,32 +238,27 @@ class CameraManager:
 def main():
     manager = CameraManager()
 
-    # اضافه کردن دوربین‌ها
+    # اضافه کردن دوربین‌ها:
     manager.add_camera("دوربین لپتاپ", 0, "دوربین لپتاپ")
-    manager.add_camera("نماز خانه", "rtsp://admin:shn123456789@192.168.1.101:554/cam/realmonitor?channel=1",
-                       "نماز خانه")
+    manager.add_camera("نماز خونه", "rtsp://admin:shn123456789@192.168.1.101:554/cam/realmonitor?channel=1", "نمازخونه")
 
-    # زمان‌بندی پاکسازی last_checkin هر 2 ساعت
     schedule.every(2).hours.do(manager.last_checkin.clear)
 
-    # تعریف تابع مدیریت رویدادهای ماوس
     def mouse_handler(event, x, y, flags, param):
         if event == cv2.EVENT_LBUTTONDBLCLK:
             manager.toggle_fullscreen(x, y)
 
-    # ایجاد پنجره نمایش به همراه یک تصویر اولیه
     cv2.namedWindow(manager.window_name, cv2.WINDOW_NORMAL)
     cv2.imshow(manager.window_name, np.zeros((480, 640, 3), dtype=np.uint8))
 
     try:
         cv2.setMouseCallback(manager.window_name, mouse_handler)
     except cv2.error as e:
-        print(f"❌ خطا در تنظیم رویدادهای ماوس: {e}")
+        logger.error(f"خطا در تنظیم رویدادهای ماوس: {e}")
 
     if not manager.cameras:
-        print("❌ هیچ دوربینی متصل نشد. برنامه در حالت شبیه‌سازی ادامه می‌یابد.")
+        logger.error("هیچ دوربینی متصل نشد. برنامه در حالت شبیه‌سازی ادامه می‌یابد.")
 
-    # حلقه اصلی برنامه
     try:
         while True:
             manager.update_frames()
@@ -227,3 +277,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
